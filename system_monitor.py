@@ -1,398 +1,392 @@
 #!/usr/bin/env python3
 """
-Advanced System Monitoring App with:
-- Real-time curses dashboard
-- CSV logging
-- Email alerts on high CPU/RAM/Disk
-- Sparkline graphs
-- Process filtering
-- Fully commented for learning
+ULTIMATE Web System Monitor
+- Flask + SocketIO
+- Live Chart.js graphs
+- Top processes, Disk I/O, Uptime, Dark Mode
+- CSV export, Email alerts
+- Mobile-first, responsive
 """
 
-import time
-import csv
 import os
-import sys
-import curses
+import csv
+import time
 import psutil
-import datetime
 import threading
+import datetime
 import smtplib
+from flask import Flask, render_template_string, send_from_directory
+from flask_socketio import SocketIO
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from collections import deque
 from typing import Dict, List, Any
 
-# ===================================================================
-# ========================== CONFIGURATION ==========================
-# ===================================================================
-
-# How often to update (in seconds)
+# ========================= CONFIG =========================
 REFRESH_INTERVAL = 1.0
-
-# CSV log file
-LOG_FILE = "system_monitor_log.csv"
-
-# How many data points to keep for graphs
 MAX_HISTORY = 200
+PROCESS_FILTER = None  # e.g. "python", "chrome"
 
-# Filter processes by name (set to None to monitor all)
-PROCESS_FILTER = None  # Example: "python", "chrome", "nginx"
-
-# Email alert settings (configure your own!)
+# Email
 ENABLE_EMAIL_ALERTS = True
-ALERT_COOLDOWN = 300  # seconds between alerts (5 min)
-SMTP_SERVER = "smtp.gmail.com"  # Change if using another provider
+ALERT_COOLDOWN = 300
+SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
-SENDER_EMAIL = "your_email@gmail.com"  # CHANGE ME
-SENDER_PASSWORD = "your_app_password"  # CHANGE ME (use App Password for Gmail)
-RECIPIENT_EMAIL = "admin@yourdomain.com"  # CHANGE ME
+SENDER_EMAIL = "your_email@gmail.com"          # CHANGE ME
+SENDER_PASSWORD = "your_app_password"          # CHANGE ME
+RECIPIENT_EMAIL = "admin@yourdomain.com"       # CHANGE ME
 
-# Alert thresholds
-CPU_THRESHOLD = 90.0    # % - send alert if CPU > this
-RAM_THRESHOLD = 90.0    # % - send alert if RAM > this
-DISK_THRESHOLD = 95.0   # % - send alert if Disk > this
+# Thresholds
+CPU_THRESHOLD = 90.0
+RAM_THRESHOLD = 90.0
+DISK_THRESHOLD = 95.0
 
-# ===================================================================
-# ========================== EMAIL ALERTS ===========================
-# ===================================================================
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'super-secret-key-2025'
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
+# Data
+history: Dict[str, deque] = {}
+net_io_prev = {"sent": 0, "recv": 0, "time": time.time()}
+disk_io_prev = {"read": 0, "write": 0, "time": time.time()}
+alert_manager = None
+CSV_LOG = "web_monitor_pro.csv"
+csv_lock = threading.Lock()
+
+# ======================= EMAIL ALERTS =======================
 class AlertManager:
-    """
-    Handles sending email alerts with cooldown to avoid spam.
-    """
     def __init__(self):
-        self.last_alert_time = 0
+        self.last_sent = 0
 
-    def should_send(self) -> bool:
-        """Check if enough time has passed since last alert."""
+    def can_send(self):
         now = time.time()
-        if now - self.last_alert_time >= ALERT_COOLDOWN:
-            self.last_alert_time = now
+        if now - self.last_sent >= ALERT_COOLDOWN:
+            self.last_sent = now
             return True
         return False
 
-    def send_email(self, subject: str, body: str):
-        """Send email using SMTP."""
+    def send(self, subject: str, body: str):
         if not ENABLE_EMAIL_ALERTS:
             return
-
         msg = MIMEMultipart()
         msg['From'] = SENDER_EMAIL
         msg['To'] = RECIPIENT_EMAIL
         msg['Subject'] = subject
-
         msg.attach(MIMEText(body, 'plain'))
-
         try:
             server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
             server.starttls()
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
-            text = msg.as_string()
-            server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, text)
+            server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
             server.quit()
-            print(f"[ALERT SENT] {subject}")
+            print(f"[ALERT] {subject}")
         except Exception as e:
-            print(f"[EMAIL FAILED] {e}")
+            print(f"[EMAIL ERROR] {e}")
 
-# Create global alert manager
 alert_manager = AlertManager()
 
-# ===================================================================
-# ========================== CSV LOGGER THREAD ======================
-# ===================================================================
+# ======================= DATA COLLECTOR =======================
+def collect_data() -> dict:
+    now = datetime.datetime.now()
+    ts = now.isoformat(timespec='seconds')
+    current_time = time.time()
 
-class CSVLogger(threading.Thread):
-    """
-    Background thread that writes monitoring data to CSV file.
-    Runs forever until program exits.
-    """
-    def __init__(self, queue: deque):
-        super().__init__(daemon=True)  # Dies when main program exits
-        self.queue = queue
-        self.start()  # Start thread immediately
+    # System
+    cpu = psutil.cpu_percent(interval=None)
+    mem = psutil.virtual_memory()
+    disk = psutil.disk_usage('/')
+    net = psutil.net_io_counters()
+    disk_io = psutil.disk_io_counters()
+    boot_time = datetime.datetime.fromtimestamp(psutil.boot_time())
+    uptime = now - boot_time
+    load = os.getloadavg() if hasattr(os, 'getloadavg') else (0, 0, 0)
 
-    def run(self):
-        """Write queued rows to CSV file."""
-        # Write header only if file doesn't exist
-        write_header = not os.path.exists(LOG_FILE)
-        with open(LOG_FILE, "a", newline="", buffering=1) as f:
-            writer = csv.writer(f)
-            if write_header:
-                writer.writerow([
-                    "timestamp",
-                    "cpu_percent",
-                    "ram_percent",
-                    "ram_used_gb",
-                    "disk_percent",
-                    "net_sent_mb",
-                    "net_recv_mb",
-                    "process_count",
-                    "filtered_cpu",
-                    "filtered_ram_gb"
-                ])
-            # Keep checking queue
-            while True:
-                if self.queue:
-                    row = self.queue.popleft()
-                    writer.writerow(row)
-                time.sleep(0.1)  # Avoid busy loop
+    # Network speed
+    elapsed_net = current_time - net_io_prev["time"]
+    sent_mbps = (net.bytes_sent - net_io_prev["sent"]) / (1024**2) / max(elapsed_net, 0.1)
+    recv_mbps = (net.bytes_recv - net_io_prev["recv"]) / (1024**2) / max(elapsed_net, 0.1)
+    net_io_prev["sent"] = net.bytes_sent
+    net_io_prev["recv"] = net.bytes_recv
+    net_io_prev["time"] = current_time
 
-# ===================================================================
-# ========================== DATA COLLECTOR =========================
-# ===================================================================
+    # Disk I/O speed
+    elapsed_disk = current_time - disk_io_prev["time"]
+    read_mbps = (disk_io.read_bytes - disk_io_prev["read"]) / (1024**2) / max(elapsed_disk, 0.1)
+    write_mbps = (disk_io.write_bytes - disk_io_prev["write"]) / (1024**2) / max(elapsed_disk, 0.1)
+    disk_io_prev["read"] = disk_io.read_bytes
+    disk_io_prev["write"] = disk_io.write_bytes
+    disk_io_prev["time"] = current_time
 
-def collect_data(history: Dict[str, deque], net_io_prev: Dict[str, int], log_queue: deque) -> dict:
-    """
-    Collect system metrics and return current values + CSV row.
-    Also updates history for graphs and checks for alerts.
-    """
-    now = datetime.datetime.now().isoformat(timespec="seconds")
+    # Top processes
+    processes = []
+    for p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_info']):
+        try:
+            info = p.info
+            if info['cpu_percent'] is not None:
+                processes.append({
+                    'pid': info['pid'],
+                    'name': info['name'],
+                    'cpu': round(info['cpu_percent'], 1),
+                    'ram': round(info['memory_info'].rss / (1024**2), 1)
+                })
+        except:
+            continue
+    top_cpu = sorted(processes, key=lambda x: x['cpu'], reverse=True)[:5]
+    top_ram = sorted(processes, key=lambda x: x['ram'], reverse=True)[:5]
 
-    # --------------------- System Metrics ---------------------
-    cpu_percent = psutil.cpu_percent(interval=None)  # % CPU usage
-    memory = psutil.virtual_memory()
-    disk = psutil.disk_usage("/")
-    net_io = psutil.net_io_counters()
-    process_count = len(psutil.pids())
-
-    # --------------------- Network Delta ---------------------
-    # Calculate MB sent/received since last check
-    sent_mb = (net_io.bytes_sent - net_io_prev.get("sent", 0)) / (1024 ** 2)
-    recv_mb = (net_io.bytes_recv - net_io_prev.get("recv", 0)) / (1024 ** 2)
-    net_io_prev["sent"] = net_io.bytes_sent
-    net_io_prev["recv"] = net_io.bytes_recv
-
-    # --------------------- Filtered Processes ---------------------
-    filtered_cpu = 0.0
-    filtered_ram_bytes = 0
+    # Filtered
+    f_cpu = f_ram = 0
     for p in psutil.process_iter(['name', 'cpu_percent', 'memory_info']):
         try:
             if PROCESS_FILTER and PROCESS_FILTER.lower() not in p.info['name'].lower():
                 continue
-            filtered_cpu += p.info['cpu_percent'] or 0.0
-            filtered_ram_bytes += p.info['memory_info'].rss
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            continue  # Skip dead or inaccessible processes
-    filtered_ram_gb = round(filtered_ram_bytes / (1024 ** 3), 2)
+            f_cpu += p.info['cpu_percent'] or 0
+            f_ram += p.info['memory_info'].rss
+        except:
+            continue
+    f_ram_gb = round(f_ram / (1024**3), 2)
 
-    # --------------------- Update History (for graphs) ---------------------
-    for key, value in [
-        ("cpu", cpu_percent),
-        ("ram", memory.percent),
-        ("disk", disk.percent),
-        ("net_sent", sent_mb),
-        ("net_recv", recv_mb),
-        ("filtered_cpu", filtered_cpu),
-        ("filtered_ram", filtered_ram_gb),
+    # Update history
+    for k, v in [
+        ('cpu', cpu), ('ram', mem.percent), ('disk', disk.percent),
+        ('sent', sent_mbps), ('recv', recv_mbps),
+        ('read', read_mbps), ('write', write_mbps)
     ]:
-        h = history.setdefault(key, deque(maxlen=MAX_HISTORY))
-        h.append(value)
+        h = history.setdefault(k, deque(maxlen=MAX_HISTORY))
+        h.append(round(v, 3))
 
-    # --------------------- Build CSV Row ---------------------
-    csv_row = [
-        now,
-        round(cpu_percent, 1),
-        round(memory.percent, 1),
-        round(memory.used / (1024 ** 3), 2),
-        round(disk.percent, 1),
-        round(sent_mb, 3),
-        round(recv_mb, 3),
-        process_count,
-        round(filtered_cpu, 1),
-        filtered_ram_gb
+    # CSV
+    row = [
+        ts, round(cpu,1), round(mem.percent,1), round(mem.used/(1024**3),2),
+        round(disk.percent,1), round(sent_mbps,3), round(recv_mbps,3),
+        round(read_mbps,3), round(write_mbps,3),
+        len(psutil.pids()), round(f_cpu,1), f_ram_gb
     ]
+    with csv_lock:
+        write_header = not os.path.exists(CSV_LOG)
+        with open(CSV_LOG, 'a', newline='') as f:
+            w = csv.writer(f)
+            if write_header:
+                w.writerow([
+                    'ts','cpu%','ram%','ram_gb','disk%','net_sent','net_recv',
+                    'disk_read','disk_write','procs','f_cpu%','f_ram_gb'
+                ])
+            w.writerow(row)
 
-    # --------------------- Check Alert Thresholds ---------------------
+    # Alerts
     alerts = []
-    if cpu_percent > CPU_THRESHOLD:
-        alerts.append(f"CPU usage is {cpu_percent:.1f}% (> {CPU_THRESHOLD}%)")
-    if memory.percent > RAM_THRESHOLD:
-        alerts.append(f"RAM usage is {memory.percent:.1f}% (> {RAM_THRESHOLD}%)")
-    if disk.percent > DISK_THRESHOLD:
-        alerts.append(f"Disk usage is {disk.percent:.1f}% (> {DISK_THRESHOLD}%)")
+    if cpu > CPU_THRESHOLD: alerts.append(f"CPU {cpu:.1f}%")
+    if mem.percent > RAM_THRESHOLD: alerts.append(f"RAM {mem.percent:.1f}%")
+    if disk.percent > DISK_THRESHOLD: alerts.append(f"Disk {disk.percent:.1f}%")
+    if alerts and alert_manager.can_send():
+        threading.Thread(target=alert_manager.send,
+                         args=("HIGH USAGE ALERT", f"{ts}\n" + "\n".join(alerts)),
+                         daemon=True).start()
 
-    if alerts and alert_manager.should_send():
-        subject = "SYSTEM ALERT: High Resource Usage"
-        body = f"Timestamp: {now}\n\n" + "\n".join(alerts)
-        threading.Thread(target=alert_manager.send_email, args=(subject, body), daemon=True).start()
-
-    # Return everything needed
     return {
-        "csv_row": csv_row,
-        "net_io_prev": net_io_prev,
-        "current": {
-            "timestamp": now,
-            "cpu": cpu_percent,
-            "ram_percent": memory.percent,
-            "ram_used_gb": round(memory.used / (1024 ** 3), 2),
-            "disk": disk.percent,
-            "net_sent": sent_mb,
-            "net_recv": recv_mb,
-            "processes": process_count,
-            "filtered_cpu": filtered_cpu,
-            "filtered_ram_gb": filtered_ram_gb,
-        }
+        'ts': ts[11:19],
+        'cpu': round(cpu,1),
+        'ram_pct': round(mem.percent,1),
+        'ram_gb': round(mem.used/(1024**3),2),
+        'disk': round(disk.percent,1),
+        'sent': round(sent_mbps,3),
+        'recv': round(recv_mbps,3),
+        'read': round(read_mbps,3),
+        'write': round(write_mbps,3),
+        'procs': len(psutil.pids()),
+        'uptime': str(uptime).split('.')[0],
+        'load': [round(x,2) for x in load],
+        'top_cpu': top_cpu,
+        'top_ram': top_ram,
+        'f_cpu': round(f_cpu,1),
+        'f_ram': f_ram_gb,
+        'history': {k: list(v) for k, v in history.items()}
     }
 
-# ===================================================================
-# ========================== CURSES DASHBOARD =======================
-# ===================================================================
-
-def draw_sparkline(stdscr, y: int, x: int, data: List[float], width: int, label: str):
-    """Draw a small sparkline graph (like ▁▃▄▅█)."""
-    if not data:
-        return
-    max_val = max(data) if max(data) > 0 else 1
-    bars = "▁▂▃▄▅▆▇█"
-    spark = "".join(bars[min(int(v / max_val * (len(bars) - 1)), len(bars) - 1)] for v in data[-width:])
-    line = f"{label:<10}: [{spark}]"
-    try:
-        stdscr.addstr(y, x, line[:width + 12])
-    except:
-        pass  # Ignore if out of bounds
-
-def draw_dashboard(stdscr, history: dict, current: dict):
-    """Draw the full terminal dashboard."""
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(1, -1, -1)           # Default
-    curses.init_pair(2, curses.COLOR_GREEN, -1)
-    curses.init_pair(3, curses.COLOR_YELLOW, -1)
-    curses.init_pair(4, curses.COLOR_RED, -1)
-
-    stdscr.clear()
-    h, w = stdscr.getmaxyx()
-
-    # Title
-    title = " SYSTEM MONITOR (q to quit) "
-    stdscr.addstr(0, 0, title.center(w), curses.A_BOLD | curses.color_pair(2))
-
-    row = 2
-
-    def print_stat(label: str, value: Any, unit: str = "", threshold=None, is_percent=False):
-        nonlocal row
-        if row >= h - 1:
-            return
-        text = f"{label:<20}: {value}{unit}"
-        color = 1
-        if threshold is not None:
-            if is_percent and value > threshold * 0.95:
-                color = 4
-            elif is_percent and value > threshold * 0.8:
-                color = 3
-            elif value > threshold:
-                color = 4
-        stdscr.addstr(row, 2, text.ljust(w - 4), curses.color_pair(color))
-        row += 1
-
-    # System Stats
-    print_stat("Timestamp", current["timestamp"][11:19])  # Time only
-    print_stat("CPU Usage", f"{current['cpu']:.1f}", "%", CPU_THRESHOLD, True)
-    print_stat("RAM Usage", f"{current['ram_percent']:.1f}", "%", RAM_THRESHOLD, True)
-    print_stat("RAM Used", f"{current['ram_used_gb']:.2f}", " GB")
-    print_stat("Disk Usage", f"{current['disk']:.1f}", "%", DISK_THRESHOLD, True)
-    print_stat("Net Sent (Δ)", f"{current['net_sent']:.3f}", " MB")
-    print_stat("Net Recv (Δ)", f"{current['net_recv']:.3f}", " MB")
-    print_stat("Total Processes", current["processes"])
-
-    if PROCESS_FILTER:
-        row += 1
-        stdscr.addstr(row, 2, f"--- Filtered: '{PROCESS_FILTER}' ---".center(w-4), curses.A_DIM)
-        row += 1
-        print_stat("Filtered CPU", f"{current['filtered_cpu']:.1f}", "%")
-        print_stat("Filtered RAM", f"{current['filtered_ram_gb']:.2f}", " GB")
-
-    row += 1
-
-    # Sparkline Graphs
-    graph_width = min(50, w - 25)
-    metrics = [
-        ("cpu", "CPU", history.get("cpu", [])),
-        ("ram", "RAM", history.get("ram", [])),
-        ("disk", "Disk", history.get("disk", [])),
-    ]
-    for metric, label, data in metrics:
-        if row >= h - 1:
-            break
-        draw_sparkline(stdscr, row, 2, list(data), graph_width, label)
-        row += 1
-
-    # Footer
-    footer = "Press 'q' to quit | Alerts: Email enabled" if ENABLE_EMAIL_ALERTS else "Alerts: Disabled"
-    stdscr.addstr(h-1, 0, footer.center(w), curses.A_DIM)
-
-    stdscr.refresh()
-
-# ===================================================================
-# ========================== MAIN LOOP ==============================
-# ===================================================================
-
-def main(stdscr):
-    """Main function run by curses.wrapper()."""
-    curses.curs_set(0)           # Hide cursor
-    stdscr.nodelay(True)         # Non-blocking input
-
-    # Data structures
-    history: Dict[str, deque] = {}           # For graphs
-    log_queue = deque(maxlen=1000)           # For CSV logger
-    net_io_prev = {}                         # Track network delta
-
-    # Start CSV logger in background
-    CSVLogger(log_queue)
-
-    # Initial dummy data
-    current_data = {
-        "timestamp": "0000-00-00T00:00:00",
-        "cpu": 0.0, "ram_percent": 0.0, "ram_used_gb": 0.0,
-        "disk": 0.0, "net_sent": 0.0, "net_recv": 0.0,
-        "processes": 0, "filtered_cpu": 0.0, "filtered_ram_gb": 0.0
-    }
-
-    print("Starting system monitor... (press 'q' to quit)")
-
+# ======================= BACKGROUND =======================
+def background_task():
     while True:
-        start_time = time.time()
+        data = collect_data()
+        socketio.emit('update', data, broadcast=True)
+        time.sleep(REFRESH_INTERVAL)
 
-        # Collect fresh data
-        result = collect_data(history, net_io_prev, log_queue)
-        net_io_prev = result["net_io_prev"]
-        current_data = result["current"]
-        log_queue.append(result["csv_row"])
+# ======================= HTML TEMPLATE =======================
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>System Monitor Pro</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <style>
+    :root { --bg: #f8f9fa; --card: white; --text: #222; --accent: #1976d2; }
+    .dark { --bg: #121212; --card: #1e1e1e; --text: #e0e0e0; --accent: #90caf9; }
+    body { margin:0; font-family: system-ui; background: var(--bg); color: var(--text); transition: 0.3s; }
+    .container { max-width: 1400px; margin: auto; padding: 1rem; }
+    h1 { text-align:center; margin:0.5rem 0; }
+    .controls { text-align:center; margin:1rem 0; }
+    button { padding:0.5rem 1rem; margin:0 0.5rem; border:none; border-radius:6px; background:var(--accent); color:white; cursor:pointer; }
+    button:hover { filter: brightness(0.9); }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(300px,1fr)); gap:1rem; }
+    .card { background:var(--card); border-radius:12px; padding:1rem; box-shadow:0 2px 8px rgba(0,0,0,0.1); }
+    .card h3 { margin:0 0 0.5rem; font-size:1rem; opacity:0.8; }
+    .value { font-size:2rem; font-weight:bold; margin:0.5rem 0; }
+    .high { color:#d32f2f; } .warn { color:#f9a825; }
+    canvas { height:70px !important; }
+    table { width:100%; border-collapse:collapse; font-size:0.9rem; }
+    th, td { padding:0.4rem; text-align:left; border-bottom:1px solid rgba(0,0,0,0.1); }
+    .footer { text-align:center; padding:1rem; font-size:0.8rem; opacity:0.7; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>System Monitor Pro</h1>
+  <div class="controls">
+    <button onclick="downloadCSV()">Download CSV</button>
+    <button onclick="toggleDark()">Dark Mode</button>
+  </div>
 
-        # Draw UI
-        draw_dashboard(stdscr, history, current_data)
+  <div class="grid" id="stats"></div>
 
-        # Sleep to maintain refresh rate
-        elapsed = time.time() - start_time
-        time.sleep(max(0, REFRESH_INTERVAL - elapsed))
+  <div class="footer" id="status">Connecting...</div>
+</div>
 
-        # Check for 'q' to quit
-        key = stdscr.getch()
-        if key == ord('q') or key == ord('Q'):
-            break
+<script>
+const socket = io();
+let charts = {};
+let dark = false;
 
-# ===================================================================
-# ========================== ENTRY POINT ============================
-# ===================================================================
+socket.on('connect', () => {
+  document.getElementById('status').textContent = 'Live • Updated every second';
+});
+socket.on('update', d => updateAll(d));
 
-if __name__ == "__main__":
-    print("System Monitor Starting...")
-    print(f"Logging to: {os.path.abspath(LOG_FILE)}")
-    if ENABLE_EMAIL_ALERTS:
-        print(f"Email alerts enabled -> {RECIPIENT_EMAIL}")
-    else:
-        print("Email alerts disabled.")
+function color(val, high, warn) {
+  if (val > high) return 'high';
+  if (val > warn) return 'warn';
+  return '';
+}
 
-    # Run with proper curses handling
-    try:
-        if sys.platform == "win32":
-            # Windows needs special handling
-            import curses
-            curses.wrapper(main)
-        else:
-            curses.wrapper(main)
-    except KeyboardInterrupt:
-        print("\nMonitoring stopped by user.")
-    finally:
-        print(f"Log saved to: {os.path.abspath(LOG_FILE)}")
+function updateAll(d) {
+  const c = document.getElementById('stats');
+  if (!c.innerHTML) initDashboard(c);
+
+  // Update values
+  document.getElementById('time').textContent = d.ts;
+  document.getElementById('cpu').textContent = d.cpu; document.getElementById('cpu').className = 'value ' + color(d.cpu,90,70);
+  document.getElementById('ram').textContent = d.ram_pct; document.getElementById('ram').className = 'value ' + color(d.ram_pct,90,70);
+  document.getElementById('ramgb').textContent = d.ram_gb + ' GB';
+  document.getElementById('disk').textContent = d.disk; document.getElementById('disk').className = 'value ' + color(d.disk,95,80);
+  document.getElementById('sent').textContent = d.sent;
+  document.getElementById('recv').textContent = d.recv;
+  document.getElementById('read').textContent = d.read;
+  document.getElementById('write').textContent = d.write;
+  document.getElementById('procs').textContent = d.procs;
+  document.getElementById('uptime').textContent = d.uptime;
+  document.getElementById('load').textContent = d.load.join(' | ');
+
+  {{#if process_filter}}
+  document.getElementById('fcpu').textContent = d.f_cpu;
+  document.getElementById('fram').textContent = d.f_ram + ' GB';
+  {{/if}}
+
+  // Top processes
+  ['cpu', 'ram'].forEach(type => {
+    const tbody = document.getElementById('top-' + type).querySelector('tbody');
+    tbody.innerHTML = '';
+    (d['top_' + type] || []).forEach(p => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${p.name}</td><td>${p.pid}</td><td>${type==='cpu'?p.cpu+'%':p.ram+' MB'}</td>`;
+      tbody.appendChild(tr);
+    });
+  });
+
+  // Charts
+  ['cpu','ram','disk','sent','recv','read','write'].forEach(m => {
+    if (charts[m]) {
+      charts[m].data.labels = Array(d.history[m].length).fill('');
+      charts[m].data.datasets[0].data = d.history[m];
+      charts[m].update('quiet');
+    }
+  });
+}
+
+function initDashboard(container) {
+  const cards = [
+    {id:'time', title:'Time', big:true},
+    {id:'cpu', title:'CPU %', chart:true},
+    {id:'ram', title:'RAM %', chart:true},
+    {id:'ramgb', title:'RAM Used'},
+    {id:'disk', title:'Disk %', chart:true},
+    {id:'sent', title:'Net Sent (MB/s)', chart:true},
+    {id:'recv', title:'Net Recv (MB/s)', chart:true},
+    {id:'read', title:'Disk Read (MB/s)', chart:true},
+    {id:'write', title:'Disk Write (MB/s)', chart:true},
+    {id:'procs', title:'Processes'},
+    {id:'uptime', title:'Uptime'},
+    {id:'load', title:'Load Avg (1/5/15)'},
+    {{#if process_filter}}
+    {id:'fcpu', title:'Filtered CPU %'},
+    {id:'fram', title:'Filtered RAM (GB)'},
+    {{/if}}
+  ];
+
+  cards.forEach(c => {
+    const card = document.createElement('div'); card.className = 'card';
+    card.innerHTML = `<h3>${c.title}</h3><div id="${c.id}" class="value">—</div>${c.chart?'<canvas id="chart-'+c.id+'"></canvas>':''}`;
+    container.appendChild(card);
+    if (c.big) card.querySelector('.value').style.fontSize = '2.4rem';
+    if (c.chart) initChart(c.id);
+  });
+
+  // Top processes
+  ['cpu', 'ram'].forEach(t => {
+    const card = document.createElement('div'); card.className = 'card';
+    card.innerHTML = `<h3>Top 5 by ${t.toUpperCase()}</h3><table id="top-${t}"><thead><tr><th>Name</th><th>PID</th><th>${t==='cpu'?'%':'MB'}</th></tr></thead><tbody></tbody></table>`;
+    container.appendChild(card);
+  });
+}
+
+function initChart(id) {
+  const ctx = document.getElementById('chart-'+id).getContext('2d');
+  charts[id] = new Chart(ctx, {
+    type: 'line',
+    data: { labels: [], datasets: [{ data: [], borderColor: '#1976d2', fill: true, tension: 0.3, pointRadius: 0 }] },
+    options: { animation: false, scales: { x:{display:false}, y:{display:false} }, plugins: { legend: {display:false} } }
+  });
+}
+
+function downloadCSV() {
+  fetch('/download').then(r=>r.blob()).then(b=>{
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b);
+    a.download = 'system_monitor_pro.csv';
+    a.click();
+  });
+}
+
+function toggleDark() {
+  dark = !dark;
+  document.body.classList.toggle('dark', dark);
+}
+</script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML, process_filter=PROCESS_FILTER)
+
+@app.route('/download')
+def download():
+    return send_from_directory('.', CSV_LOG, as_attachment=True)
+
+# ======================= START =======================
+if __name__ == '__main__':
+    print("Web Monitor Pro Starting...")
+    print(f"Open: http://127.0.0.1:5000")
+    print(f"Log: {os.path.abspath(CSV_LOG)}")
+    threading.Thread(target=background_task, daemon=True).start()
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False)
